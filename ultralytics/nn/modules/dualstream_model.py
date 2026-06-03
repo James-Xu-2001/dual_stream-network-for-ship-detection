@@ -45,20 +45,22 @@ class DualStreamDetectionModel(DetectionModel):
         # Build model with IR stream starting index
         # IR stream starts at layer 10 in the YAML configuration
         self.model, self.save = parse_model(self.yaml, ch=ch, verbose=verbose, ir_start_idx=10)
-        # 直接修改原张量的值，不创建新副本
+        
         self.inplace = self.yaml.get("inplace", True)
         
         # Set stride manually for dual-stream (skip the problematic stride check)
         # Standard YOLO strides: P3=8, P4=16, P5=32
         self.stride = torch.tensor([8, 16, 32])
         
-        # Also set stride on the OBB detection head layer
-        # v8OBBLoss reads stride from model.model[-1].stride, not from model.stride
-        if hasattr(self.model[-1], 'stride'):
+        # Also set stride on the OBB detection head layer.
+        # v8OBBLoss and Detect.bias_init() read stride from model.model[-1].stride.
+        if hasattr(self.model[-1], "stride"):
             self.model[-1].stride = torch.tensor([8, 16, 32])
         
         # Initialize weights
         initialize_weights(self)
+        if hasattr(self.model[-1], "bias_init"):
+            self.model[-1].bias_init()
         
         # Store input channels for each stream
         self.ch_vis = ch
@@ -90,6 +92,7 @@ class DualStreamDetectionModel(DetectionModel):
             f"RGB channels={self.ch_vis}, IR channels={self.ch_ir}, "
             f"classes={self.yaml['nc']}, stride={self.stride.tolist()}"
         )
+        self.criterion = None
     
     def forward(self, x: torch.Tensor | dict, *args, **kwargs):
 
@@ -257,8 +260,10 @@ class DualStreamDetectionModel(DetectionModel):
         # Reference: ultralytics/engine/trainer.py line 437 - loss.sum()
         # Use OBB loss for rotated detection
         from ultralytics.utils.loss import v8OBBLoss
-        loss_fn = v8OBBLoss(self)
-        loss_output = loss_fn(preds, batch)
+        raw_preds = preds[1] if isinstance(preds, tuple) else preds
+        if self.criterion is None or self.criterion.device != raw_preds["boxes"].device:
+            self.criterion = v8OBBLoss(self)
+        loss_output = self.criterion(preds, batch)
         
         # Extract loss components from the tuple
         # First element: loss components multiplied by batch_size (for gradient computation)

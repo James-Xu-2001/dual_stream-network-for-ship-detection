@@ -499,10 +499,10 @@ class DualStreamOBBDataLoader:
         
         if labels:
             # Concatenate all labels
-            labels = torch.from_numpy(np.concatenate(labels, axis=0))
+            labels = torch.from_numpy(np.concatenate(labels, axis=0)).float()
         else:
             # Empty batch: [batch_idx, cls, 5 coordinates (xywhr)] = 7 columns
-            labels = torch.zeros(0, 7)
+            labels = torch.zeros(0, 7, dtype=torch.float32)
         
         return {
             "vis": vis_imgs,

@@ -20,6 +20,7 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
+import numpy as np
 import torch
 import torch.nn as nn
 import yaml
@@ -32,6 +33,8 @@ from ultralytics import YOLO
 from ultralytics.nn.modules.dualstream_model import DualStreamYOLO, DualStreamDetectionModel
 from ultralytics.data.dataset_obb import DualStreamOBBDataLoader
 from ultralytics.utils import LOGGER, colorstr
+from ultralytics.utils.metrics import ap_per_class, batch_probiou
+from ultralytics.utils.nms import non_max_suppression
 from training_logger import create_logger, log_batch
 
 
@@ -69,8 +72,123 @@ def parse_args():
     args.cache = False
     args.resume = False
     args.verbose = True
+    args.val_conf = 0.001
+    args.val_iou = 0.5
+    args.max_det = 300
     
     return args
+
+
+def match_obb_predictions(pred_cls, target_cls, iou, iouv):
+    correct = np.zeros((pred_cls.shape[0], iouv.shape[0]), dtype=bool)
+    if pred_cls.shape[0] == 0 or target_cls.shape[0] == 0:
+        return correct
+
+    pred_cls = pred_cls.astype(np.int64)
+    target_cls = target_cls.astype(np.int64)
+    class_match = target_cls[:, None] == pred_cls[None, :]
+
+    for ti, threshold in enumerate(iouv):
+        matches = np.argwhere((iou >= threshold) & class_match)
+        if matches.shape[0] == 0:
+            continue
+        match_ious = iou[matches[:, 0], matches[:, 1]]
+        matches = matches[match_ious.argsort()[::-1]]
+        matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
+        matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
+        correct[matches[:, 1].astype(int), ti] = True
+    return correct
+
+
+@torch.no_grad()
+def validate_epoch(model, val_loader, device, imgsz, nc, conf_thres=0.001, iou_thres=0.5, max_det=300):
+    model.eval()
+    val_loss = 0.0
+    loss_batches = 0
+    stats = {"tp": [], "conf": [], "pred_cls": [], "target_cls": []}
+    iouv = torch.linspace(0.5, 0.95, 10, device=device)
+
+    for batch in val_loader:
+        batch["vis"] = batch["vis"].to(device)
+        batch["ir"] = batch["ir"].to(device)
+        batch["labels"] = batch["labels"].to(device)
+
+        try:
+            loss = model(batch)
+            val_loss += loss.item()
+            loss_batches += 1
+        except Exception as e:
+            LOGGER.warning(f"Error in validation loss batch: {e}")
+
+        try:
+            preds = model.model._predict_dual({"vis": batch["vis"], "ir": batch["ir"]})
+            detections = non_max_suppression(
+                preds,
+                conf_thres=conf_thres,
+                iou_thres=iou_thres,
+                nc=nc,
+                max_det=max_det,
+                rotated=True,
+            )
+            labels = batch["labels"]
+            batch_size = batch["vis"].shape[0]
+
+            for si in range(batch_size):
+                target = labels[labels[:, 0].long() == si]
+                target_cls = target[:, 1].long()
+                target_bboxes = target[:, 2:7].clone()
+                if target_bboxes.numel():
+                    target_bboxes[:, :4] *= imgsz
+
+                det = detections[si]
+                if det.shape[0]:
+                    pred_bboxes = torch.cat((det[:, :4], det[:, -1:]), dim=1)
+                    pred_conf = det[:, 4]
+                    pred_cls = det[:, 5].long()
+                else:
+                    pred_bboxes = torch.zeros(0, 5, device=device)
+                    pred_conf = torch.zeros(0, device=device)
+                    pred_cls = torch.zeros(0, dtype=torch.long, device=device)
+
+                if pred_bboxes.shape[0] and target_bboxes.shape[0]:
+                    iou = batch_probiou(target_bboxes, pred_bboxes).detach().cpu().numpy()
+                    tp = match_obb_predictions(
+                        pred_cls.detach().cpu().numpy(),
+                        target_cls.detach().cpu().numpy(),
+                        iou,
+                        iouv.detach().cpu().numpy(),
+                    )
+                else:
+                    tp = np.zeros((pred_bboxes.shape[0], iouv.numel()), dtype=bool)
+
+                stats["tp"].append(tp)
+                stats["conf"].append(pred_conf.detach().cpu().numpy())
+                stats["pred_cls"].append(pred_cls.detach().cpu().numpy())
+                stats["target_cls"].append(target_cls.detach().cpu().numpy())
+        except Exception as e:
+            LOGGER.warning(f"Error in validation metrics batch: {e}")
+
+    metrics = {
+        "precision": 0.0,
+        "recall": 0.0,
+        "mAP50": 0.0,
+        "mAP50-95": 0.0,
+    }
+    if stats["tp"]:
+        tp = np.concatenate(stats["tp"], 0)
+        conf = np.concatenate(stats["conf"], 0)
+        pred_cls = np.concatenate(stats["pred_cls"], 0)
+        target_cls = np.concatenate(stats["target_cls"], 0)
+        if tp.shape[0] and target_cls.shape[0]:
+            _, _, p, r, _, ap, *_ = ap_per_class(tp, conf, pred_cls, target_cls, plot=False)
+            metrics = {
+                "precision": float(p.mean()) if p.size else 0.0,
+                "recall": float(r.mean()) if r.size else 0.0,
+                "mAP50": float(ap[:, 0].mean()) if ap.size else 0.0,
+                "mAP50-95": float(ap.mean()) if ap.size else 0.0,
+            }
+
+    return val_loss / max(loss_batches, 1), metrics
 
 
 def train(args):
@@ -289,24 +407,23 @@ def train(args):
         
         train_logger.flush()
         
-        model.eval()
-        val_loss = 0.0
-        
-        with torch.no_grad():
-            for batch in val_loader:
-                batch["vis"] = batch["vis"].to(device)
-                batch["ir"] = batch["ir"].to(device)
-                batch["labels"] = batch["labels"].to(device)
-                
-                try:
-                    loss = model(batch)
-                    val_loss += loss.item()
-                except Exception as e:
-                    LOGGER.warning(f"Error in validation batch: {e}")
-                    continue
-        
-        val_loss /= max(len(val_loader), 1)
-        LOGGER.info(f"  Validation loss: {val_loss:.4f}")
+        val_loss, val_metrics = validate_epoch(
+            model,
+            val_loader,
+            device,
+            args.imgsz,
+            args.nc,
+            conf_thres=args.val_conf,
+            iou_thres=args.val_iou,
+            max_det=args.max_det,
+        )
+        LOGGER.info(
+            f"  Validation loss: {val_loss:.4f} | "
+            f"P: {val_metrics['precision']:.4f} | R: {val_metrics['recall']:.4f} | "
+            f"mAP50: {val_metrics['mAP50']:.4f} | mAP50-95: {val_metrics['mAP50-95']:.4f}"
+        )
+        train_logger.log_epoch(epoch + 1, train_loss, val_loss, val_metrics)
+        train_logger.flush()
         
         if val_loss < best_fitness:
             best_fitness = val_loss

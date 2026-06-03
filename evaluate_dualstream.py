@@ -279,8 +279,10 @@ class DualStreamOBBEvaluator:
                     "cls": torch.zeros(0, dtype=torch.long, device=labels.device),
                 })
             else:
+                bboxes = img_labels[:, 2:7].clone()
+                bboxes[:, :4] *= self.args.imgsz
                 results.append({
-                    "bboxes": img_labels[:, 2:7],
+                    "bboxes": bboxes,
                     "cls": img_labels[:, 1].long(),
                 })
         return results

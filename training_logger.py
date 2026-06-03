@@ -90,6 +90,28 @@ class TrainingLogger:
         if self._write_count % self.flush_interval == 0:
             self._file.flush()
 
+    def log_epoch(
+        self,
+        epoch: int,
+        train_loss: float,
+        val_loss: float,
+        metrics: Optional[dict] = None,
+    ):
+        entry = {
+            "type": "epoch",
+            "epoch": epoch,
+            "train_loss": float(train_loss),
+            "val_loss": float(val_loss),
+            "metrics": metrics or {},
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+        self._file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        self._write_count += 1
+
+        if self._write_count % self.flush_interval == 0:
+            self._file.flush()
+
     def flush(self):
         if self._file:
             self._file.flush()
