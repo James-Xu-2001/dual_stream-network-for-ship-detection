@@ -9,6 +9,7 @@ This script demonstrates how to train a dual-stream YOLOv8 model for
 visible + infrared object detection.
 
 Usage:
+    python train_dualstream.py --config train_dualstream.yaml
     python train_dualstream.py --data dataset_root --epochs 100 --batch 16
 
 Requirements:
@@ -16,67 +17,175 @@ Requirements:
     - YOLO-format annotations
 """
 
+import argparse
+import math
 import sys
+import logging
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import torch
-import torch.nn as nn
-import yaml
+try:
+    import yaml
+except ModuleNotFoundError:
+    yaml = None
 
 ROOT = Path(__file__).resolve().parents[0]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-from ultralytics import YOLO
-from ultralytics.nn.modules.dualstream_model import DualStreamYOLO, DualStreamDetectionModel
-from ultralytics.data.dataset_obb import DualStreamOBBDataLoader
-from ultralytics.utils import LOGGER, colorstr
-from ultralytics.utils.metrics import ap_per_class, batch_probiou
-from ultralytics.utils.nms import non_max_suppression
 from training_logger import create_logger, log_batch
+
+logging.basicConfig(level=logging.INFO, format="%(message)s")
+LOGGER = logging.getLogger("train_dualstream")
+
+
+def colorstr(*args):
+    return str(args[-1])
+
+
+DEFAULT_CONFIG = {
+    "data": "./Tship",
+    "nc": 5,
+    "model": "ultralytics/cfg/models/v8/yolov8-dualstream.yaml",
+    "weights": None,
+    "fusion_mode": "concat",
+    "epochs": 100,
+    "batch": 4,
+    "imgsz": 640,
+    "device": "0",
+    "workers": 8,
+    "optimizer": "AdamW",
+    "lr0": 0.001,
+    "lrf": 0.01,
+    "momentum": 0.9,
+    "weight_decay": 0.0005,
+    "warmup_epochs": 3,
+    "clip_grad": 10.0,
+    "hsv_h": 0.015,
+    "hsv_s": 0.7,
+    "hsv_v": 0.4,
+    "project": "runs/dualstream-train",
+    "name": "tship_exp",
+    "exist_ok": False,
+    "cache": False,
+    "resume": False,
+    "verbose": True,
+    "val_conf": 0.001,
+    "val_iou": 0.5,
+    "max_det": 300,
+    "save_metric": "mAP50-95",
+}
+
+
+def parse_scalar(value):
+    value = value.strip()
+    if value == "":
+        return None
+    if value[0:1] == value[-1:] and value[:1] in {"'", '"'}:
+        return value[1:-1]
+    lowered = value.lower()
+    if lowered in {"true", "false"}:
+        return lowered == "true"
+    if lowered in {"null", "none", "~"}:
+        return None
+    try:
+        return int(value)
+    except ValueError:
+        pass
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def yaml_safe_load(stream):
+    if yaml is not None:
+        return yaml.safe_load(stream)
+
+    data = {}
+    for raw_line in stream:
+        line = raw_line.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        data[key.strip()] = parse_scalar(value)
+    return data
+
+
+def yaml_safe_dump(data, stream):
+    if yaml is not None:
+        yaml.safe_dump(data, stream, sort_keys=False)
+        return
+
+    for key, value in data.items():
+        if isinstance(value, bool):
+            value = str(value).lower()
+        elif value is None:
+            value = ""
+        stream.write(f"{key}: {value}\n")
+
+
+def str_to_bool(value):
+    if isinstance(value, bool):
+        return value
+    value = value.lower()
+    if value in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if value in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
+
+
+def load_config(config_path):
+    config = DEFAULT_CONFIG.copy()
+    path = Path(config_path)
+    if not path.is_absolute():
+        path = ROOT / path
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as f:
+            loaded = yaml_safe_load(f) or {}
+        unknown = sorted(set(loaded) - set(DEFAULT_CONFIG))
+        if unknown:
+            LOGGER.warning(f"Ignoring unknown config keys: {unknown}")
+        config.update({k: v for k, v in loaded.items() if k in DEFAULT_CONFIG})
+    else:
+        LOGGER.warning(f"Config file not found: {path}. Falling back to built-in defaults.")
+    return config, path
+
+
+def increment_path(path):
+    path = Path(path)
+    if not path.exists():
+        return path
+    for i in range(2, 10000):
+        candidate = path.with_name(f"{path.name}_{i}")
+        if not candidate.exists():
+            return candidate
+    raise RuntimeError(f"Unable to find available save directory for {path}")
 
 
 def parse_args():
-    args = SimpleNamespace()
-    
-    args.data = "./Tship"
-    args.nc = 5
-    
-    args.model = "yolov8-dualstream.yaml"
-    args.weights = None
-    args.fusion_mode = "concat"
-    
-    args.epochs = 100
-    args.batch = 4
-    args.imgsz = 640
-    args.device = "0"
-    args.workers = 8
-    
-    args.optimizer = "AdamW"
-    args.lr0 = 0.001
-    args.lrf = 0.01
-    args.momentum = 0.9
-    args.weight_decay = 0.0005
-    args.warmup_epochs = 3
-    args.clip_grad = 10.0
-    
-    args.hsv_h = 0.015
-    args.hsv_s = 0.7
-    args.hsv_v = 0.4
-    
-    args.project = "runs/dualstream-train"
-    args.name = "tship_exp"
-    args.exist_ok = False
-    args.cache = False
-    args.resume = False
-    args.verbose = True
-    args.val_conf = 0.001
-    args.val_iou = 0.5
-    args.max_det = 300
-    
-    return args
+    parser = argparse.ArgumentParser(description="Train a dual-stream YOLOv8 OBB model.")
+    parser.add_argument("--config", default=str(ROOT / "argument.yaml"), help="Path to YAML training config.")
+
+    for key, default in DEFAULT_CONFIG.items():
+        arg_type = str_to_bool if isinstance(default, bool) else type(default) if default is not None else str
+        if isinstance(default, bool):
+            parser.add_argument(f"--{key}", type=arg_type, nargs="?", const=True, default=None)
+        else:
+            parser.add_argument(f"--{key}", type=arg_type, default=None)
+
+    parsed = parser.parse_args()
+    config, config_path = load_config(parsed.config)
+
+    for key in DEFAULT_CONFIG:
+        value = getattr(parsed, key)
+        if value is not None:
+            config[key] = value
+    config["config"] = str(config_path)
+    return SimpleNamespace(**config)
 
 
 def match_obb_predictions(pred_cls, target_cls, iou, iouv):
@@ -192,9 +301,22 @@ def validate_epoch(model, val_loader, device, imgsz, nc, conf_thres=0.001, iou_t
 
 
 def train(args):
+    global LOGGER, DualStreamOBBDataLoader, DualStreamYOLO, ap_per_class, batch_probiou, colorstr, non_max_suppression
+
+    from ultralytics.data.dataset_obb import DualStreamOBBDataLoader
+    from ultralytics.nn.modules.dualstream_model import DualStreamYOLO
+    from ultralytics.utils import LOGGER as ultralytics_logger
+    from ultralytics.utils import colorstr as ultralytics_colorstr
+    from ultralytics.utils.metrics import ap_per_class, batch_probiou
+    from ultralytics.utils.nms import non_max_suppression
+
+    LOGGER = ultralytics_logger
+    colorstr = ultralytics_colorstr
+
     LOGGER.info(f"\n{colorstr('green', 'Starting dual-stream Network training')}")
     LOGGER.info(f"Dataset: {args.data}")
     LOGGER.info(f"Model: {args.model}")
+    LOGGER.info(f"Config: {args.config}")
     LOGGER.info(f"Classes: {args.nc}")
     LOGGER.info(f"Device: {args.device}")
     LOGGER.info(f"Optimizer: {args.optimizer}, lr0={args.lr0}, lrf={args.lrf}")
@@ -245,11 +367,14 @@ def train(args):
     LOGGER.info(f"Val dataset: {len(val_loader.dataset)} images")
     
     total_batches = len(train_loader)
+    if total_batches == 0:
+        raise RuntimeError("Training dataloader is empty. Check dataset path and split structure.")
     total_steps = args.epochs * total_batches
     warmup_steps = args.warmup_epochs * total_batches
     
     # Create optimizer
-    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    trainable_param_count = sum(p.numel() for p in trainable_params)
     
     optimizer_map = {
         "SGD": lambda: torch.optim.SGD(trainable_params, lr=args.lr0, momentum=args.momentum,
@@ -265,50 +390,34 @@ def train(args):
         args.optimizer = "AdamW"
     
     optimizer = optimizer_map[args.optimizer]()
-    LOGGER.info(f"Created {args.optimizer} optimizer with {sum(p.numel() for p in trainable_params):,} parameters")
+    LOGGER.info(f"Created {args.optimizer} optimizer with {trainable_param_count:,} trainable parameters")
     
-    # Cosine learning rate scheduler with warmup
-    # LambdaLR multiplies base_lr by the return value of lr_lambda.
-    # lr_lambda returns a MULTIPLIER, not an absolute LR value.
-    # Warmup: multiplier ramps from 0 → 1.0
-    # Cosine: multiplier decays from 1.0 → lrf
+    # LambdaLR expects a multiplier, not an absolute learning rate.
     def lr_lambda(step):
-        if step < warmup_steps:
-            return (step + 1) / warmup_steps       # 0 → 1.0 (effective LR: 0 → lr0)
+        if warmup_steps > 0 and step < warmup_steps:
+            return (step + 1) / warmup_steps
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
-        cosine_decay = 0.5 * (1 + torch.cos(torch.tensor(torch.pi) * progress).item())
-        return args.lrf + (1 - args.lrf) * cosine_decay  # 1.0 → lrf (effective LR: lr0 → lrf*lr0)
-    
+        cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
+        return args.lrf + (1 - args.lrf) * cosine_decay
+
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda, last_epoch=-1)
     
     model_yaml = args.model
-    train_config = {
-        "epochs": args.epochs,
-        "batch_size": args.batch,
-        "imgsz": args.imgsz,
-        "lr0": args.lr0,
-        "lrf": args.lrf,
-        "momentum": args.momentum,
-        "weight_decay": args.weight_decay,
-        "optimizer": args.optimizer,
-        "device": device,
-        "workers": args.workers,
-        "project": args.project,
-        "name": args.name,
-        "exist_ok": args.exist_ok,
-        "verbose": args.verbose,
-        "nc": args.nc,
-        "fusion_mode": args.fusion_mode,
-        "warmup_epochs": args.warmup_epochs,
-        "clip_grad": args.clip_grad,
-        "model": str(Path(model_yaml).resolve()),  # save YAML path for loading
-    }
+    train_config = vars(args).copy()
+    train_config.update(
+        {
+            "batch_size": args.batch,
+            "device": device,
+            "model": str(Path(model_yaml).resolve()),
+        }
+    )
     
     save_dir = Path(args.project) / args.name
+    save_dir = save_dir if args.exist_ok else increment_path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     
-    with open(save_dir / "train_config.yaml", "w") as f:
-        yaml.dump(train_config, f)
+    with open(save_dir / "train_config.yaml", "w", encoding="utf-8") as f:
+        yaml_safe_dump(train_config, f)
     
     LOGGER.info(f"\nTraining configuration saved to {save_dir}")
     
@@ -318,16 +427,19 @@ def train(args):
     LOGGER.info(f"\n{colorstr('blue', 'Starting training for')} {args.epochs} epochs...")
     LOGGER.info(f"Total batches/epoch: {total_batches}, Warmup: {warmup_steps} steps")
     
-    best_fitness = float("inf")
+    save_metric = args.save_metric
+    metric_mode = "min" if save_metric in {"loss", "val_loss"} else "max"
+    best_fitness = float("inf") if metric_mode == "min" else -float("inf")
     best_epoch = -1
     
     for epoch in range(args.epochs):
-        LOGGER.info(f"\n{'─' * 60}")
+        LOGGER.info(f"\n{'-' * 60}")
         LOGGER.info(f"Epoch {epoch + 1}/{args.epochs}  lr: {optimizer.param_groups[0]['lr']:.6f}")
-        LOGGER.info(f"{'─' * 60}")
+        LOGGER.info(f"{'-' * 60}")
         
         model.train()
         train_loss = 0.0
+        valid_batches = 0
         nan_count = 0
         
         for batch_idx, batch in enumerate(train_loader):
@@ -343,11 +455,11 @@ def train(args):
                     nan_count += 1
                     if nan_count <= 3:
                         LOGGER.warning(
-                            f"  [{batch_idx + 1:3d}/{total_batches}] NaN/Inf loss detected — skipping batch"
+                            f"  [{batch_idx + 1:3d}/{total_batches}] NaN/Inf loss detected - skipping batch"
                         )
                     continue
                 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
                 loss.backward()
                 
                 grad_norm = None
@@ -356,11 +468,11 @@ def train(args):
                         model.parameters(), max_norm=args.clip_grad
                     )
                     if grad_norm is not None and (torch.isnan(grad_norm) or torch.isinf(grad_norm)):
-                        optimizer.zero_grad()
+                        optimizer.zero_grad(set_to_none=True)
                         nan_count += 1
                         if nan_count <= 3:
                             LOGGER.warning(
-                                f"  [{batch_idx + 1:3d}/{total_batches}] NaN/Inf gradient — skipping batch"
+                                f"  [{batch_idx + 1:3d}/{total_batches}] NaN/Inf gradient detected - skipping batch"
                             )
                         continue
                 
@@ -368,6 +480,7 @@ def train(args):
                 scheduler.step()
                 
                 train_loss += loss.item()
+                valid_batches += 1
                 
                 log_batch(
                     train_logger, epoch + 1, batch_idx + 1,
@@ -400,10 +513,10 @@ def train(args):
                 LOGGER.warning(f"Traceback: {traceback.format_exc()}")
                 continue
         
-        train_loss /= total_batches
+        train_loss /= max(valid_batches, 1)
         LOGGER.info(f"  Avg training loss: {train_loss:.4f}")
         if nan_count > 0:
-            LOGGER.warning(f"  Skipped {nan_count} batches due to NaN/Inf — consider reducing lr or box weight")
+            LOGGER.warning(f"  Skipped {nan_count} batches due to NaN/Inf - consider reducing lr or box weight")
         
         train_logger.flush()
         
@@ -425,8 +538,11 @@ def train(args):
         train_logger.log_epoch(epoch + 1, train_loss, val_loss, val_metrics)
         train_logger.flush()
         
-        if val_loss < best_fitness:
-            best_fitness = val_loss
+        fitness = val_loss if metric_mode == "min" else val_metrics.get(save_metric, 0.0)
+        improved = fitness < best_fitness if metric_mode == "min" else fitness > best_fitness
+
+        if improved:
+            best_fitness = fitness
             best_epoch = epoch
             best_model_path = save_dir / "best.pt"
             
@@ -434,23 +550,29 @@ def train(args):
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
                 "loss": val_loss,
+                "metrics": val_metrics,
+                "fitness": best_fitness,
+                "save_metric": save_metric,
                 "train_args": train_config,
             }, best_model_path)
             
-            LOGGER.info(f"  ✓ New best model saved ({best_fitness:.4f}) → {best_model_path}")
+            LOGGER.info(f"  New best model saved ({save_metric}={best_fitness:.4f}) -> {best_model_path}")
         else:
-            LOGGER.info(f"  (best so far: {best_fitness:.4f} at epoch {best_epoch + 1})")
+            LOGGER.info(f"  (best {save_metric}: {best_fitness:.4f} at epoch {best_epoch + 1})")
         
         last_model_path = save_dir / "last.pt"
         torch.save({
             "epoch": epoch,
             "model_state_dict": model.state_dict(),
             "loss": val_loss,
+            "metrics": val_metrics,
+            "fitness": fitness,
+            "save_metric": save_metric,
             "train_args": train_config,
         }, last_model_path)
     
     LOGGER.info(f"\n{colorstr('green', 'Training completed!')}")
-    LOGGER.info(f"Best epoch: {best_epoch + 1} with val loss: {best_fitness:.4f}")
+    LOGGER.info(f"Best epoch: {best_epoch + 1} with {save_metric}: {best_fitness:.4f}")
     LOGGER.info(f"Best model: {save_dir / 'best.pt'}")
     
     train_logger.close()

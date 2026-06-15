@@ -1,0 +1,45 @@
+# Dual-stream YOLOv8 OBB training configuration.
+
+# Dataset
+data: ./Tship
+nc: 5
+
+# Model
+model: ultralytics/cfg/models/v8/yolov8-dualstream.yaml
+weights:
+fusion_mode: concat
+
+# Runtime
+epochs: 10
+batch: 4
+imgsz: 640
+device: "0"
+workers: 8
+
+# Optimization
+optimizer: AdamW
+lr0: 0.001
+lrf: 0.01
+momentum: 0.9
+weight_decay: 0.0005
+warmup_epochs: 3
+clip_grad: 10.0
+
+# Augmentation
+hsv_h: 0.015
+hsv_s: 0.7
+hsv_v: 0.4
+
+# Output
+project: runs/dualstream-train
+name: tship_exp
+exist_ok: false
+cache: false
+resume: false
+verbose: true
+
+# Validation
+val_conf: 0.001
+val_iou: 0.5
+max_det: 300
+save_metric: mAP50-95
