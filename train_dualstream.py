@@ -45,40 +45,6 @@ def colorstr(*args):
     return str(args[-1])
 
 
-DEFAULT_CONFIG = {
-    "data": "./Tship",
-    "nc": 5,
-    "model": "ultralytics/cfg/models/v8/yolov8-dualstream.yaml",
-    "weights": None,
-    "fusion_mode": "concat",
-    "epochs": 100,
-    "batch": 4,
-    "imgsz": 640,
-    "device": "0",
-    "workers": 8,
-    "optimizer": "AdamW",
-    "lr0": 0.001,
-    "lrf": 0.01,
-    "momentum": 0.9,
-    "weight_decay": 0.0005,
-    "warmup_epochs": 3,
-    "clip_grad": 10.0,
-    "hsv_h": 0.015,
-    "hsv_s": 0.7,
-    "hsv_v": 0.4,
-    "project": "runs/dualstream-train",
-    "name": "tship_exp",
-    "exist_ok": False,
-    "cache": False,
-    "resume": False,
-    "verbose": True,
-    "val_conf": 0.001,
-    "val_iou": 0.5,
-    "max_det": 300,
-    "save_metric": "mAP50-95",
-}
-
-
 def parse_scalar(value):
     value = value.strip()
     if value == "":
@@ -126,7 +92,7 @@ def yaml_safe_dump(data, stream):
             value = ""
         stream.write(f"{key}: {value}\n")
 
-
+# 数据类型
 def str_to_bool(value):
     if isinstance(value, bool):
         return value
@@ -137,21 +103,16 @@ def str_to_bool(value):
         return False
     raise argparse.ArgumentTypeError(f"Invalid boolean value: {value}")
 
-
+# 加载 YAML 配置文件，返回配置字典和配置文件路径
 def load_config(config_path):
-    config = DEFAULT_CONFIG.copy()
+    """Load YAML training config. Raises FileNotFoundError if config is missing."""
     path = Path(config_path)
     if not path.is_absolute():
         path = ROOT / path
-    if path.exists():
-        with open(path, "r", encoding="utf-8") as f:
-            loaded = yaml_safe_load(f) or {}
-        unknown = sorted(set(loaded) - set(DEFAULT_CONFIG))
-        if unknown:
-            LOGGER.warning(f"Ignoring unknown config keys: {unknown}")
-        config.update({k: v for k, v in loaded.items() if k in DEFAULT_CONFIG})
-    else:
-        LOGGER.warning(f"Config file not found: {path}. Falling back to built-in defaults.")
+    if not path.exists():
+        raise FileNotFoundError(f"Config file not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        config = yaml_safe_load(f) or {}
     return config, path
 
 
@@ -167,25 +128,32 @@ def increment_path(path):
 
 
 def parse_args():
+    # 从 sys.argv 中提取 --config 的值，确定加载哪个 YAML
+    config_arg = str(ROOT / "argument.yaml")
+    for i, arg in enumerate(sys.argv[1:]):
+        if arg == "--config" and i + 2 < len(sys.argv):
+            config_arg = sys.argv[i + 2]
+            break
+        elif arg.startswith("--config="):
+            config_arg = arg.split("=", 1)[1]
+            break
+
+    config, config_path = load_config(config_arg)
+
+    # 单一 parser：YAML 值作为 default，CLI 自然覆盖
     parser = argparse.ArgumentParser(description="Train a dual-stream YOLOv8 OBB model.")
-    parser.add_argument("--config", default=str(ROOT / "argument.yaml"), help="Path to YAML training config.")
+    parser.add_argument("--config", default=str(config_path), help="Path to YAML training config.")
 
-    for key, default in DEFAULT_CONFIG.items():
-        arg_type = str_to_bool if isinstance(default, bool) else type(default) if default is not None else str
-        if isinstance(default, bool):
-            parser.add_argument(f"--{key}", type=arg_type, nargs="?", const=True, default=None)
+    for key, value in config.items():
+        if isinstance(value, bool):
+            parser.add_argument(f"--{key}", type=str_to_bool, nargs="?", const=True, default=value)
+        elif value is None:
+            parser.add_argument(f"--{key}", type=str, default=None)
         else:
-            parser.add_argument(f"--{key}", type=arg_type, default=None)
-
-    parsed = parser.parse_args()
-    config, config_path = load_config(parsed.config)
-
-    for key in DEFAULT_CONFIG:
-        value = getattr(parsed, key)
-        if value is not None:
-            config[key] = value
-    config["config"] = str(config_path)
-    return SimpleNamespace(**config)
+            parser.add_argument(f"--{key}", type=type(value), default=value)
+    # argparse 的 default 机制天然实现了"YAML 是底座，CLI 是覆盖层"的优先级链。
+    args = parser.parse_args()
+    return SimpleNamespace(**vars(args))
 
 
 def match_obb_predictions(pred_cls, target_cls, iou, iouv):
@@ -250,7 +218,9 @@ def validate_epoch(model, val_loader, device, imgsz, nc, conf_thres=0.001, iou_t
                     target_bboxes[:, :4] *= imgsz
 
                 det = detections[si]
+                # 用于获取张量或数组第一维度大小的属性
                 if det.shape[0]:
+                    #-1:最后一列，dim=1:按列拼接
                     pred_bboxes = torch.cat((det[:, :4], det[:, -1:]), dim=1)
                     pred_conf = det[:, 4]
                     pred_cls = det[:, 5].long()
@@ -372,7 +342,7 @@ def train(args):
     total_steps = args.epochs * total_batches
     warmup_steps = args.warmup_epochs * total_batches
     
-    # Create optimizer
+    # Create optimizer 确定可训练参数数量
     trainable_params = [p for p in model.parameters() if p.requires_grad]
     trainable_param_count = sum(p.numel() for p in trainable_params)
     
@@ -384,7 +354,7 @@ def train(args):
         "AdamW": lambda: torch.optim.AdamW(trainable_params, lr=args.lr0, betas=(args.momentum, 0.999),
                                              weight_decay=args.weight_decay),
     }
-    
+    # 如果yaml文件中出现的优化器不在map中，则使用AdamW优化器，并给出警告
     if args.optimizer not in optimizer_map:
         LOGGER.warning(f"Unknown optimizer '{args.optimizer}', falling back to AdamW")
         args.optimizer = "AdamW"
@@ -392,27 +362,27 @@ def train(args):
     optimizer = optimizer_map[args.optimizer]()
     LOGGER.info(f"Created {args.optimizer} optimizer with {trainable_param_count:,} trainable parameters")
     
-    # LambdaLR expects a multiplier, not an absolute learning rate.
+    # 学习率调度器，使用预热结合余弦退火算法
     def lr_lambda(step):
+        # 预热阶段，学习率线性增加
         if warmup_steps > 0 and step < warmup_steps:
             return (step + 1) / warmup_steps
+        # 预热阶段后，使用余弦退火算法
         progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
+        # 余弦退火算法，学习率线性增加到最大值，然后线性减小到最小值，cosine_decay从1降至0.
         cosine_decay = 0.5 * (1 + math.cos(math.pi * progress))
         return args.lrf + (1 - args.lrf) * cosine_decay
 
+    # 学习率调度器，便于动态调节学习率
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda, last_epoch=-1)
     
     model_yaml = args.model
     train_config = vars(args).copy()
-    train_config.update(
-        {
-            "batch_size": args.batch,
-            "device": device,
-            "model": str(Path(model_yaml).resolve()),
-        }
-    )
+    train_config["device"] = device
+    train_config["model"] = str(Path(model_yaml).resolve())
     
     save_dir = Path(args.project) / args.name
+    # 若已存在相同路径，则自动递增路径。eg. exp1->exp2
     save_dir = save_dir if args.exist_ok else increment_path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     
@@ -464,6 +434,7 @@ def train(args):
                 
                 grad_norm = None
                 if args.clip_grad > 0:
+                    # 计算梯度的L2范数，如果范数大于max_norm，则进行裁剪
                     grad_norm = torch.nn.utils.clip_grad_norm_(
                         model.parameters(), max_norm=args.clip_grad
                     )
@@ -480,8 +451,9 @@ def train(args):
                 scheduler.step()
                 
                 train_loss += loss.item()
+                # 实际产生loss次数valid_batches
                 valid_batches += 1
-                
+                # Batch级别日志
                 log_batch(
                     train_logger, epoch + 1, batch_idx + 1,
                     loss_value=loss.item(),
@@ -517,7 +489,7 @@ def train(args):
         LOGGER.info(f"  Avg training loss: {train_loss:.4f}")
         if nan_count > 0:
             LOGGER.warning(f"  Skipped {nan_count} batches due to NaN/Inf - consider reducing lr or box weight")
-        
+        # train_logger.flush()作用是强制将日志缓冲区中的数据立即写入磁盘，确保训练过程中的所有记录被安全持久化，而不会因为程序意外崩溃而丢失。
         train_logger.flush()
         
         val_loss, val_metrics = validate_epoch(
@@ -530,6 +502,7 @@ def train(args):
             iou_thres=args.val_iou,
             max_det=args.max_det,
         )
+        # .4f表示保留4位小数, f""表示格式化字符串
         LOGGER.info(
             f"  Validation loss: {val_loss:.4f} | "
             f"P: {val_metrics['precision']:.4f} | R: {val_metrics['recall']:.4f} | "
@@ -545,7 +518,7 @@ def train(args):
             best_fitness = fitness
             best_epoch = epoch
             best_model_path = save_dir / "best.pt"
-            
+            # 保存最佳模型检查点的标准操作
             torch.save({
                 "epoch": epoch,
                 "model_state_dict": model.state_dict(),
