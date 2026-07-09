@@ -179,6 +179,7 @@ def match_obb_predictions(pred_cls, target_cls, iou, iouv):
 
 @torch.no_grad()
 def validate_epoch(model, val_loader, device, imgsz, nc, conf_thres=0.001, iou_thres=0.5, max_det=300):
+    #将模型设置为评估/推理模式。禁用 Dropout，BatchNorm 使用训练时累积的全局均值和方差。
     model.eval()
     val_loss = 0.0
     loss_batches = 0
@@ -412,7 +413,7 @@ def train(args):
         LOGGER.info(f"\n{'-' * 60}")
         LOGGER.info(f"Epoch {epoch + 1}/{args.epochs}  lr: {optimizer.param_groups[0]['lr']:.6f}")
         LOGGER.info(f"{'-' * 60}")
-        
+        # 将模型设置为训练模式。启用 Dropout、BatchNorm 等层的行为。
         model.train()
         train_loss = 0.0
         valid_batches = 0

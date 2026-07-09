@@ -307,24 +307,23 @@ class DualStreamYOLO(nn.Module):
         
         return model
     
-    def forward(self, x: dict | torch.Tensor, *args, **kwargs):
+    def forward(self, x: dict | torch.Tensor):
         """Forward pass through the model."""
-        return self.model(x, *args, **kwargs)
+        return self.model(x)
     
-    def predict(self, x_vis: torch.Tensor, x_ir: torch.Tensor, **kwargs):
+    def predict(self, x_vis: torch.Tensor, x_ir: torch.Tensor):
         """Perform prediction on visible and infrared inputs.
         
         Args:
             x_vis: Visible image tensor (B, C, H, W).
             x_ir: Infrared image tensor (B, C, H, W).
-            **kwargs: Additional arguments for prediction.
         
         Returns:
             Detection predictions.
         """
         self.model.eval()
         with torch.no_grad():
-            return self.model({"vis": x_vis, "ir": x_ir}, **kwargs)
+            return self.model({"vis": x_vis, "ir": x_ir})
     
     def train(self, mode: bool = True):
         """Set model to training/evaluation mode."""
