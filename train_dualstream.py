@@ -306,6 +306,12 @@ def train(args):
         LOGGER.info(f"Creating model from config: {args.model}")
         model = DualStreamYOLO(args.model, verbose=args.verbose)
     
+    # 将损失权重从 argument.yaml 注入到 model.args（覆盖硬编码默认值）
+    for loss_key in ("box", "cls", "dfl", "angle"):
+        val = getattr(args, loss_key, None)
+        if val is not None:
+            setattr(model.model.args, loss_key, val)
+    
     model.to(device)
     
     LOGGER.info("\nLoading datasets...")

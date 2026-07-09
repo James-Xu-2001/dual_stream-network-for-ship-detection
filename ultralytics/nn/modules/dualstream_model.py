@@ -59,6 +59,7 @@ class DualStreamDetectionModel(DetectionModel):
         
         # Initialize weights
         initialize_weights(self)
+        # 用于根据数据集的类别数或锚框尺寸，对偏置项进行特殊初始化
         if hasattr(self.model[-1], "bias_init"):
             self.model[-1].bias_init()
         
@@ -71,10 +72,6 @@ class DualStreamDetectionModel(DetectionModel):
         self.args = SimpleNamespace(
             overlap_mask=True,  # Default value for OBB loss
             reg_max=16,  # DFL regression max channels
-            # Hyperparameters for loss calculation
-            # From-scratch training: use moderate box weight to avoid ProbIoU gradient explosion.
-            # Standard YOLOv8 box=7.5 assumes pretrained backbone; for from-scratch, use 1.5-3.0.
-            # Can be gradually increased after initial convergence.
             box=1.5,  # box loss gain (ProbIoU for OBB) — moderate for from-scratch
             cls=0.5,  # cls loss gain (BCE)
             dfl=1.5,  # dfl loss gain (Distribution Focal Loss)
@@ -84,6 +81,7 @@ class DualStreamDetectionModel(DetectionModel):
         )
         
         if verbose:
+            # 调用模型的 info() 方法，该方法通常会打印模型的网络结构摘要，用于调试或查看模型架构。
             self.info()
             LOGGER.info("")
         
@@ -94,14 +92,8 @@ class DualStreamDetectionModel(DetectionModel):
         )
         self.criterion = None
     
-    def forward(self, x: torch.Tensor | dict, *args, **kwargs):
-
-        # Handle dual-stream input
-        if isinstance(x, dict):
-            return self._forward_dual(x, *args, **kwargs)
-        
-        # Handle single-stream input (for compatibility)
-        return super().forward(x, *args, **kwargs)
+    def forward(self, x: dict):
+        return self._forward_dual(x)
     
     def _forward_dual(
         self,
@@ -109,9 +101,6 @@ class DualStreamDetectionModel(DetectionModel):
         profile: bool = False,
         visualize: bool = False,
         augment: bool = False,
-        embed=None,
-        *args,
-        **kwargs,
     ):
         
         x_vis = x.get("vis")
@@ -126,7 +115,7 @@ class DualStreamDetectionModel(DetectionModel):
         # Training input format: {"vis": tensor, "ir": tensor, "labels": labels}
         if "labels" in x:
             # Training mode - compute loss
-            return self.loss(x, *args, **kwargs)
+            return self.loss(x)
         
         # Inference mode - forward pass
         return self._predict_dual(
@@ -134,7 +123,6 @@ class DualStreamDetectionModel(DetectionModel):
             profile=profile,
             visualize=visualize,
             augment=augment,
-            embed=embed,
         )
     
     def _predict_dual(
@@ -143,18 +131,13 @@ class DualStreamDetectionModel(DetectionModel):
         profile: bool = False,
         visualize: bool = False,
         augment: bool = False,
-        embed=None,
     ):
         x_vis = x["vis"]
         x_ir = x["ir"]
         
         # 统一存储所有特征（索引唯一，不会冲突）
         y = {}
-        embeddings = []
         current_output = None  # 跟踪上一层的输出
-        
-        embed = frozenset(embed) if embed is not None else {-1}
-        max_idx = max(embed)
         
         # 定义各流的第一层索引（基于 YAML 配置）
         VIS_FIRST_LAYER = 0
@@ -176,11 +159,9 @@ class DualStreamDetectionModel(DetectionModel):
                 if isinstance(m.f, int):
                     x_in = y.get(m.f)
                 else:
-                    # 多输入，如 [[4, 14], ...]
-                    # 特殊处理：j=-1 表示使用上一层的输出 (current_output)
-                    x_in = [current_output if j == -1 else y.get(j) for j in m.f if (current_output if j == -1 else y.get(j)) is not None]
-                    # 注意：即使只有一个输入，也要保持列表格式
-                    # 因为 Concat 等模块期望接收列表
+                    # 多输入
+                    x_in = [current_output if j == -1 else y.get(j) for j in m.f]
+                    # 即使只有一个输入，也保持列表格式（Concat 等模块需要列表）
                     if not x_in:
                         x_in = None
             
@@ -195,14 +176,6 @@ class DualStreamDetectionModel(DetectionModel):
                 if visualize:
                     from ultralytics.utils.plotting import feature_visualization
                     feature_visualization(out, m.type, m.i, save_dir=visualize)
-                
-                # 处理 embeddings
-                if m.i in embed:
-                    embeddings.append(
-                        torch.nn.functional.adaptive_avg_pool2d(out, (1, 1)).squeeze(-1).squeeze(-1)
-                    )
-                    if m.i == max_idx:
-                        return torch.unbind(torch.cat(embeddings, 1), dim=0)
             else:
                 out = None
         
@@ -210,14 +183,10 @@ class DualStreamDetectionModel(DetectionModel):
     
     def loss(
         self, 
-        x: dict, 
-        *args, 
-        **kwargs
+        x: dict,
     ):
         
-        # For loss computation, we need to get predictions first
-        # The loss function will compare predictions with ground truth
-        # Extract inputs and targets
+        
         x_vis = x.get("vis")
         x_ir = x.get("ir")
         labels = x.get("labels")  # Shape: (total_objects, 10)
@@ -244,6 +213,7 @@ class DualStreamDetectionModel(DetectionModel):
                     f"cy=[{bboxes_np[:, 1].min():.3f}, {bboxes_np[:, 1].max():.3f}], "
                     f"w=[{bboxes_np[:, 2].min():.3f}, {bboxes_np[:, 2].max():.3f}], "
                     f"h=[{bboxes_np[:, 3].min():.3f}, {bboxes_np[:, 3].max():.3f}]"
+                    f"angle=[{bboxes_np[:, 4].min():.3f}, {bboxes_np[:, 4].max():.3f}]"
                 )
                 self._debug_printed = True
         else:
@@ -256,55 +226,28 @@ class DualStreamDetectionModel(DetectionModel):
         # Compute loss using OBB loss function
         # v8OBBLoss returns a tuple: (loss_components * batch_size, loss_components_detached)
         # loss_components shape: [4] containing [box_loss, cls_loss, dfl_loss, angle_loss]
-        # This is consistent with YOLOv8's multi-task loss design
-        # Reference: ultralytics/engine/trainer.py line 437 - loss.sum()
-        # Use OBB loss for rotated detection
         from ultralytics.utils.loss import v8OBBLoss
         raw_preds = preds[1] if isinstance(preds, tuple) else preds
         if self.criterion is None or self.criterion.device != raw_preds["boxes"].device:
             self.criterion = v8OBBLoss(self)
         loss_output = self.criterion(preds, batch)
-        
-        # Extract loss components from the tuple
-        # First element: loss components multiplied by batch_size (for gradient computation)
-        # Second element: detached loss components (for logging/metrics)
-        if isinstance(loss_output, tuple):
-            loss_components_scaled, loss_components = loss_output  # Shape: [4] - [box, cls, dfl, angle]
-        else:
-            loss_components = loss_output
-            loss_components_scaled = loss_components
+        loss_components_scaled, loss_components = loss_output  # Shape: [4] - [box, cls, dfl, angle]
         
         # Extract individual loss components for logging
         # These are detached tensors for monitoring (no gradients)
         box_loss = loss_components[0].detach()
         cls_loss = loss_components[1].detach()
         dfl_loss = loss_components[2].detach()
+        angle_loss = loss_components[3].detach()
         
-        # Angle loss is specific to OBB detection
-        if len(loss_components) > 3:
-            angle_loss = loss_components[3].detach()
-        else:
-            angle_loss = torch.tensor(0.0, device=loss_components.device)
-        
-        # Store loss components in model for access during training
-        # This allows real-time monitoring in the training loop
         self._loss_items = torch.stack([box_loss, cls_loss, dfl_loss, angle_loss])
-        
-        # Sum all scaled loss components to get the total scalar loss for backward propagation
-        # This follows the same pattern as ultralytics/engine/trainer.py line 437
         loss = loss_components_scaled.sum()
         
         return loss
     
     def get_loss_items(self):
-        """Get detached loss components for logging.
         
-        Returns:
-            torch.Tensor: Stack of [box_loss, cls_loss, dfl_loss, angle_loss]
-        """
-        if hasattr(self, '_loss_items'):
-            return self._loss_items
-        return None
+        return self._loss_items
 
 
 class DualStreamYOLO(nn.Module):
@@ -320,15 +263,8 @@ class DualStreamYOLO(nn.Module):
         model: str = "yolov8-dualstream.yaml",
         verbose: bool = False,
     ):
-        """Initialize DualStreamYOLO.
-        
-        Args:
-            model: Path to model weights or configuration file.
-            task: Task type (detect, segment, pose, etc.).
-            verbose: Whether to print verbose output.
-        """
+       
         super().__init__()
-        
         # Load configuration
         model_path = Path(model)
         if model_path.suffix == ".pt":
@@ -344,16 +280,9 @@ class DualStreamYOLO(nn.Module):
     
     # 加载模型权重的pt文件
     def _load_weights(self, weights_path: Path) -> DualStreamDetectionModel:
-        """Load model from weights file.
-        
-        Args:
-            weights_path: Path to .pt weights file.
-        
-        Returns:
-            Loaded model.
-        """
+       
         import torch
-        
+
         # Load checkpoint
         ckpt = torch.load(weights_path, map_location="cpu")
         

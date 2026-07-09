@@ -43,3 +43,9 @@ val_conf: 0.001
 val_iou: 0.5
 max_det: 300
 save_metric: mAP50-95
+
+# Loss weights
+box: 1.5
+cls: 0.5
+dfl: 1.5
+angle: 0.1
