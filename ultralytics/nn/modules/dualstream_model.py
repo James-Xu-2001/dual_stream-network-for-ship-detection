@@ -91,6 +91,7 @@ class DualStreamDetectionModel(DetectionModel):
             f"classes={self.yaml['nc']}, stride={self.stride.tolist()}"
         )
         self.criterion = None
+        self._loss_items = torch.zeros(4)  # [box, cls, dfl, angle], placeholder until first loss() call
     
     def forward(self, x: dict):
         return self._forward_dual(x)
@@ -228,7 +229,7 @@ class DualStreamDetectionModel(DetectionModel):
         # loss_components shape: [4] containing [box_loss, cls_loss, dfl_loss, angle_loss]
         from ultralytics.utils.loss import v8OBBLoss
         raw_preds = preds[1] if isinstance(preds, tuple) else preds
-        if self.criterion is None or self.criterion.device != raw_preds["boxes"].device:
+        if self.criterion is None:
             self.criterion = v8OBBLoss(self)
         loss_output = self.criterion(preds, batch)
         loss_components_scaled, loss_components = loss_output  # Shape: [4] - [box, cls, dfl, angle]

@@ -91,11 +91,12 @@ class SpatialAttention(nn.Module):
         # Max pool along channel dimension
         max_out, _ = torch.max(x, dim=1, keepdim=True)
         
-        # Concatenate and convolve
-        x = torch.cat([avg_out, max_out], dim=1)
-        x = self.conv1(x)
+        # Concatenate and convolve to produce attention map
+        attn_input = torch.cat([avg_out, max_out], dim=1)
+        attn_map = self.sigmoid(self.conv1(attn_input))
         
-        return self.sigmoid(x) * x
+        # Apply attention map to original features
+        return x * attn_map
 
 
 class CBAM(nn.Module):
@@ -205,12 +206,7 @@ class DualStreamFusion(nn.Module):
 
 
 class FeatureFusionBlock(nn.Module):
-    """Feature fusion block with multi-level fusion.
-    
-    This block fuses features from two streams at multiple levels
-    using a combination of concatenation and convolution.
-    """
-    
+ 
     def __init__(
         self,
         c1: int,
@@ -218,14 +214,7 @@ class FeatureFusionBlock(nn.Module):
         fusion_mode: str = "concat",
         attention: bool = True,
     ):
-        """Initialize feature fusion block.
-        
-        Args:
-            c1: Input channels per stream.
-            c2: Output channels after fusion.
-            fusion_mode: Fusion mode for the block.
-            attention: Whether to apply attention.
-        """
+
         super().__init__()
         
         # Fusion module
@@ -234,19 +223,22 @@ class FeatureFusionBlock(nn.Module):
         # Feature refinement
         self.conv = C2f(c1, c2, n=1, shortcut=True) if c1 == c2 else Conv(c1, c2, k=3, p=1)
     
-    def forward(self, x_vis: torch.Tensor, x_ir: torch.Tensor) -> torch.Tensor:
-        """Fuse and refine features from two streams."""
+    def forward(self, x):
+        """Forward pass accepting either a list [vis, ir] or two separate tensors.
+
+        List format is used during manual traversal in _predict_dual.
+        """
+        if isinstance(x, list):
+            x_vis, x_ir = x[0], x[1]
+        else:
+            x_vis = x_ir = x  # fallback for single-input usage
+
         x = self.fusion(x_vis, x_ir)
         x = self.conv(x)
         return x
 
 
 class CrossModalityAttention(nn.Module):
-    """Cross-modality attention for RGB-T feature fusion.
-    
-    This module uses attention mechanisms to learn cross-modal
-    relationships between visible and infrared features.
-    """
     
     def __init__(self, channels: int, num_heads: int = 8):
         """Initialize cross-modality attention.
@@ -288,20 +280,21 @@ class CrossModalityAttention(nn.Module):
         """
         B, C, H, W = x_vis.shape
         
-        # Flatten spatial dimensions
+        # Flatten(2)代表从第二个维度开始拉平flatten.transpose(1,2)代表交换维度1和维度2。即(B, C, H, W) -> (B, H*W, C)
         x_vis_flat = x_vis.flatten(2).transpose(1, 2)  # (B, H*W, C)
         x_ir_flat = x_ir.flatten(2).transpose(1, 2)    # (B, H*W, C)
         
         # Project to Q, K, V
-        q_vis = self.q_vis(x_vis_flat).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
+        q_vis = self.q_vis(x_vis_flat).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2) # (B, H*W, C) -> (B, num_heads, H*W, head_dim)
         k_ir = self.k_ir(x_ir_flat).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
         v_ir = self.v_ir(x_ir_flat).reshape(B, -1, self.num_heads, self.head_dim).transpose(1, 2)
         
-        # Cross-attention: visible queries attend to infrared keys/values
+        # 计算query和key的点积相似度 | transpose(-2, -1)是将倒数第一个维度和倒数第二个维度的顺序调换
         attn = (q_vis @ k_ir.transpose(-2, -1)) * self.scale
+        # 得到（B, num_heads, H*W_vis, H*W_ir）
         attn = attn.softmax(dim=-1)
         
-        # Apply attention to values
+        # 得到（B, num_heads, H*W_vis, head_dim）再经过 transpose(1, 2)和reshape(B, -1, C) 得到了（B, H*W_vis, C）
         out = (attn @ v_ir).transpose(1, 2).reshape(B, -1, C)
         
         # Project back

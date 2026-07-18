@@ -93,6 +93,11 @@ from .head import (
     YOLOESegment26,
     v10Detect,
 )
+from .dualstream_fusion import (
+    
+    FeatureFusionBlock,
+    
+)
 from .transformer import (
     AIFI,
     MLP,
@@ -152,6 +157,7 @@ __all__ = (
     "DeformableTransformerDecoder",
     "DeformableTransformerDecoderLayer",
     "Detect",
+    "FeatureFusionBlock",
     "Focus",
     "GhostBottleneck",
     "GhostConv",

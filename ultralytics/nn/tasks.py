@@ -19,6 +19,7 @@ from ultralytics.nn.modules import (
     C3,
     C3TR,
     ELAN1,
+    FeatureFusionBlock,
     OBB,
     OBB26,
     PSA,
@@ -1554,14 +1555,18 @@ def parse_model(d, ch, verbose=True, ir_start_idx=None):
     # Args
     legacy = True  # backward compatibility for v3/v5/v8/v9 models
     max_channels = float("inf")
+    # end2end:是否为端到端模型
     nc, act, scales, end2end = (d.get(x) for x in ("nc", "activation", "scales", "end2end"))
     reg_max = d.get("reg_max", 16)
+    # object.get("name",number)的number是默认值
     depth, width, kpt_shape = (d.get(x, 1.0) for x in ("depth_multiple", "width_multiple", "kpt_shape"))
     scale = d.get("scale")
     if scales:
         if not scale:
+            # iter()创建一个迭代器，next()获取迭代器的下一个元素
             scale = next(iter(scales.keys()))
             LOGGER.warning(f"no model scale passed. Assuming scale='{scale}'.")
+        #确定网络缩放因子
         depth, width, max_channels = scales[scale]
 
     if act:
@@ -1575,6 +1580,7 @@ def parse_model(d, ch, verbose=True, ir_start_idx=None):
     input_channels = ch if isinstance(ch, int) else ch[0]
     ch = [ch]
     layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
+    # 一个不可变的集合，用于快速判断某个模块是否属于“基础模块”。
     base_modules = frozenset(
         {
             Classify,
@@ -1634,16 +1640,20 @@ def parse_model(d, ch, verbose=True, ir_start_idx=None):
     )
     for i, (f, n, m, args) in enumerate(d["backbone"] + d["head"]):  # from, number, module, args
         m = (
+            # getattr(a,b)是指从a模块获取b类
             getattr(torch.nn, m[3:])
             if "nn." in m
             else getattr(__import__("torchvision").ops, m[16:])
             if "torchvision.ops." in m
+            # 当前文件中定义的类
             else globals()[m]
         )  # get module
+        # 解析输入参数的字符串判断是否出现在局部变量，没有的话就常规解析
         for j, a in enumerate(args):
             if isinstance(a, str):
                 with contextlib.suppress(ValueError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
+        # 扩大模块数量
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
         if m in base_modules:
             # 特殊处理：双输入流模型中，IR 流第一层应该使用原始输入通道 (3)，而不是上一层的输出
@@ -1657,7 +1667,7 @@ def parse_model(d, ch, verbose=True, ir_start_idx=None):
             if m is C2fAttn:  # set 1) embed channels and 2) num heads
                 args[1] = make_divisible(min(args[1], max_channels // 2) * width, 8)
                 args[2] = int(max(round(min(args[2], max_channels // 2 // 32)) * width, 1) if args[2] > 1 else args[2])
-
+            # 第一个为输入通道数，第二个为输出通道数，后面保持原args的参数
             args = [c1, c2, *args[1:]]
             if m in repeat_modules:
                 args.insert(2, n)  # number of repeats
@@ -1686,6 +1696,13 @@ def parse_model(d, ch, verbose=True, ir_start_idx=None):
             args = [ch[f]]
         elif m is Concat:
             c2 = sum(ch[x] for x in f)
+        elif m is FeatureFusionBlock:
+            # Dual-stream fusion: f = [vis_layer, ir_layer], both streams have same channel count
+            c1 = ch[f[0]]  # channels per single stream
+            c2 = args[0]   # output channels (specified in YAML)
+            if c2 != nc:
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
+            args = [c1, c2, *args[1:]]
         elif m in frozenset(
             {
                 Detect,

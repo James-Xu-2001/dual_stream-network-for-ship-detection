@@ -7,22 +7,21 @@ nc: 5
 # Model
 model: ultralytics/cfg/models/v8/yolov8-dualstream.yaml
 weights:
-fusion_mode: concat
 
 # Runtime
-epochs: 100
+epochs: 30
 batch: 4
 imgsz: 640
 device: "0"
-workers: 4
+workers: 2
 
 # Optimization
 optimizer: AdamW
-lr0: 0.001
+lr0: 0.0005
 lrf: 0.01
 momentum: 0.9
 weight_decay: 0.0005
-warmup_epochs: 3
+warmup_epochs: 5
 clip_grad: 10.0
 
 # Augmentation
@@ -45,7 +44,7 @@ max_det: 300
 save_metric: mAP50-95
 
 # Loss weights
-box: 1.5
+box: 2.0
 cls: 0.5
 dfl: 1.5
 angle: 0.1
